@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Build kernel and requested modules
+    name: Build kernel with AtomISP drivers
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -16,21 +16,34 @@ jobs:
       image: debian:trixie
 
     steps:
-      - name: Install build dependencies
+      - name: Enable Debian Trixie Security repository
         shell: bash
         run: |
           set -eux
 
-          apt-get update
+          cat > /etc/apt/sources.list.d/trixie-security.list <<'EOF'
+          deb http://security.debian.org/debian-security trixie-security main
+          deb-src http://security.debian.org/debian-security trixie-security main
+          EOF
 
+          # Ensure source packages are available from the regular Trixie repository.
           if [ -f /etc/apt/sources.list.d/debian.sources ]; then
-            sed -i '/^Types:/ s/\bdeb-src\b//g; /^Types:/ s/$/ deb-src/' \
-              /etc/apt/sources.list.d/debian.sources
+            sed -i '/^Types:/ {
+              /deb-src/! s/$/ deb-src/
+            }' /etc/apt/sources.list.d/debian.sources
           elif [ -f /etc/apt/sources.list ]; then
             sed -i '/^deb /s/^deb /deb-src /' /etc/apt/sources.list
           fi
 
           apt-get update
+
+          echo "Checking requested source version:"
+          apt-cache showsrc linux | grep -F 'Version: 6.12.113-1'
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -eux
 
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential \
@@ -56,60 +69,94 @@ jobs:
             python3-setuptools \
             python3-yaml \
             python3-jinja2 \
-            python3-packaging
+            python3-packaging \
+            quilt
 
-      - name: Install kernel build dependencies
-        shell: bash
-        run: |
-          set -eux
           DEBIAN_FRONTEND=noninteractive \
             apt-get build-dep -y linux=6.12.113-1
 
-      - name: Download kernel source
+      - name: Download Linux source
         shell: bash
         run: |
           set -eux
+
           apt-get source linux=6.12.113-1
           test -d linux-6.12.113
 
-      - name: Set requested kernel modules
+      - name: Configure requested kernel modules
         working-directory: linux-6.12.113
         shell: bash
         run: |
           set -eux
 
+          # Debian reads debian/config.local when generating the flavour config.
           cat > debian/config.local <<'EOF'
+          # AtomISP parent option is boolean, not a module.
+          CONFIG_INTEL_ATOMISP=y
+
+          # AtomISP dependencies.
+          CONFIG_X86=y
+          CONFIG_EFI=y
+          CONFIG_PCI=y
+          CONFIG_ACPI=y
+          CONFIG_COMMON_CLK=y
+          CONFIG_IOSF_MBI=y
+          CONFIG_MEDIA_SUPPORT=y
+          CONFIG_MEDIA_CONTROLLER=y
+          CONFIG_MEDIA_PCI_SUPPORT=y
+          CONFIG_PMIC_OPREGION=y
+          CONFIG_VIDEO_DEV=m
+          CONFIG_I2C=m
+          CONFIG_IPU_BRIDGE=m
+
+          # Requested modules.
           CONFIG_INTEL_BYTCRC_PWRSRC=m
           CONFIG_INTEL_PUNIT_IPC=m
           CONFIG_VIDEO_ATOMISP=m
           CONFIG_VIDEO_ATOMISP_GC2235=m
           EOF
 
-          make -f debian/rules source
+          # Generate Debian kernel build rules/configuration.
+          debian/rules source
+
           DEB_RULES_REQUIRES_ROOT=no \
             make -f debian/rules.gen setup_amd64_none_amd64
 
-          CONFIG_FILE="debian/build/build_amd64_none_amd64/.config"
-          test -f "$CONFIG_FILE"
+          BUILD_DIR="debian/build/build_amd64_none_amd64"
+          CONFIG="$BUILD_DIR/.config"
 
-          echo "Checking requested symbols in the generated config:"
+          test -f "$CONFIG"
+
+          echo "Checking final generated configuration:"
+          for symbol in \
+            CONFIG_INTEL_ATOMISP \
+            CONFIG_INTEL_BYTCRC_PWRSRC \
+            CONFIG_INTEL_PUNIT_IPC \
+            CONFIG_VIDEO_ATOMISP \
+            CONFIG_VIDEO_ATOMISP_GC2235
+          do
+            grep -E "^${symbol}=|^# ${symbol} is not set" "$CONFIG" || true
+          done
+
+          # INTEL_ATOMISP is a bool and must be y.
+          grep -qx 'CONFIG_INTEL_ATOMISP=y' "$CONFIG"
+
+          # These four requested drivers must be modules.
           for symbol in \
             CONFIG_INTEL_BYTCRC_PWRSRC \
             CONFIG_INTEL_PUNIT_IPC \
             CONFIG_VIDEO_ATOMISP \
             CONFIG_VIDEO_ATOMISP_GC2235
           do
-            if ! grep -qx "${symbol}=m" "$CONFIG_FILE"; then
+            if ! grep -qx "${symbol}=m" "$CONFIG"; then
               echo "ERROR: $symbol is not enabled as a module."
-              grep -E "^(${symbol}=|# ${symbol} is not set)" \
-                "$CONFIG_FILE" || true
               exit 1
             fi
           done
 
-          echo "All requested modules are enabled."
+          echo "All requested driver settings are present."
 
-      - name: Build only amd64 kernel flavour packages
+      - name: Build amd64 kernel packages
         working-directory: linux-6.12.113
         shell: bash
         env:
@@ -117,6 +164,7 @@ jobs:
           DEB_BUILD_PROFILES: "pkg.linux.nokerneldbg pkg.linux.nokerneldbginfo"
         run: |
           set -eux
+
           export MAKEFLAGS="-j$(nproc)"
 
           make -f debian/rules.gen binary-arch_amd64_none_amd64
@@ -129,7 +177,7 @@ jobs:
           set -u
           shopt -s nullglob
 
-          packages=(linux-6.12.113/../*.deb)
+          packages=(./*.deb)
 
           if ((${#packages[@]} == 0)); then
             echo "WARNING: no Debian packages found."
@@ -160,11 +208,11 @@ jobs:
             fi
           done
 
-      - name: Upload kernel packages
+      - name: Upload Debian kernel packages
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linux-6.12.113-debian-amd64
-          path: "linux-6.12.113/../*.deb"
+          path: "*.deb"
           if-no-files-found: warn
           compression-level: 0
