@@ -1,17 +1,17 @@
-name: Build Debian 6.12.113 amd64
+name: Build Debian Kernel 6.12.113 amd64
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 permissions:
   contents: read
 
 jobs:
   build:
+    name: Build kernel and requested modules
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
     container:
       image: debian:trixie
 
@@ -20,14 +20,24 @@ jobs:
         shell: bash
         run: |
           set -eux
+
           apt-get update
+
+          if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+            sed -i '/^Types:/ s/\bdeb-src\b//g; /^Types:/ s/$/ deb-src/' \
+              /etc/apt/sources.list.d/debian.sources
+          elif [ -f /etc/apt/sources.list ]; then
+            sed -i '/^deb /s/^deb /deb-src /' /etc/apt/sources.list
+          fi
+
+          apt-get update
+
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            ca-certificates \
-            git \
             build-essential \
-            fakeroot \
+            ca-certificates \
             devscripts \
             dpkg-dev \
+            fakeroot \
             debhelper \
             bc \
             bison \
@@ -46,143 +56,83 @@ jobs:
             python3-setuptools \
             python3-yaml \
             python3-jinja2 \
-            python3-packaging \
-            wget \
-            curl
+            python3-packaging
 
-      - name: Enable Debian source repositories
+      - name: Install kernel build dependencies
         shell: bash
         run: |
           set -eux
+          DEBIAN_FRONTEND=noninteractive \
+            apt-get build-dep -y linux=6.12.113-1
 
-          if [ -f /etc/apt/sources.list.d/debian.sources ]; then
-            sed -i 's/^Types: deb$/Types: deb deb-src/' \
-              /etc/apt/sources.list.d/debian.sources
-          elif [ -f /etc/apt/sources.list ]; then
-            sed -i 's/^deb /deb deb-src /' /etc/apt/sources.list
-          fi
-
-          apt-get update
-
-      - name: Download Linux source
+      - name: Download kernel source
         shell: bash
         run: |
           set -eux
           apt-get source linux=6.12.113-1
           test -d linux-6.12.113
 
-      - name: Install Linux source build dependencies
-        working-directory: linux-6.12.113
-        shell: bash
-        run: |
-          set -eux
-          DEBIAN_FRONTEND=noninteractive apt-get build-dep -y linux=6.12.113-1
-
-      - name: Configure requested drivers
+      - name: Set requested kernel modules
         working-directory: linux-6.12.113
         shell: bash
         run: |
           set -eux
 
-          cat > /tmp/enable-requested-drivers.py <<'PY'
-          from pathlib import Path
-          import re
-          import sys
+          cat > debian/config.local <<'EOF'
+          CONFIG_INTEL_BYTCRC_PWRSRC=m
+          CONFIG_INTEL_PUNIT_IPC=m
+          CONFIG_VIDEO_ATOMISP=m
+          CONFIG_VIDEO_ATOMISP_GC2235=m
+          EOF
 
-          configs = {
-              "CONFIG_INTEL_BYTCRC_PWRSRC": "m",
-              "CONFIG_INTEL_PUNIT_IPC": "m",
-              "CONFIG_VIDEO_ATOMISP": "m",
-              "CONFIG_VIDEO_ATOMISP_GC2235": "m",
-          }
+          make -f debian/rules source
+          DEB_RULES_REQUIRES_ROOT=no \
+            make -f debian/rules.gen setup_amd64_none_amd64
 
-          candidates = [
-              Path("debian/config/config"),
-              Path("debian/config"),
-          ]
+          CONFIG_FILE="debian/build/build_amd64_none_amd64/.config"
+          test -f "$CONFIG_FILE"
 
-          files = []
-          for candidate in candidates:
-              if candidate.is_file():
-                  files.append(candidate)
-              elif candidate.is_dir():
-                  files.extend(candidate.rglob("*"))
-          files = sorted(set(p for p in files if p.is_file()))
-
-          changed = 0
-          for path in files:
-              try:
-                  text = path.read_text()
-              except (UnicodeDecodeError, OSError):
-                  continue
-
-              updated = text
-              for key, value in configs.items():
-                  pattern = rf"^(?:# )?{re.escape(key)}(?:=.*| is not set)$"
-                  replacement = f"{key}={value}"
-                  updated, count = re.subn(
-                      pattern, replacement, updated, flags=re.MULTILINE
-                  )
-                  changed += count
-
-              if updated != text:
-                  path.write_text(updated)
-
-          print(f"Updated {changed} existing config entries.")
-          print("Note: this does not add symbols absent from Debian config files.")
-          PY
-
-          python3 /tmp/enable-requested-drivers.py
-
-          echo "Checking whether the requested symbols exist in the source:"
+          echo "Checking requested symbols in the generated config:"
           for symbol in \
             CONFIG_INTEL_BYTCRC_PWRSRC \
             CONFIG_INTEL_PUNIT_IPC \
             CONFIG_VIDEO_ATOMISP \
             CONFIG_VIDEO_ATOMISP_GC2235
           do
-            if grep -R -l --include='Kconfig*' --include='*.Kconfig' \
-              "$symbol" drivers 2>/dev/null | head -n 1; then
-              echo "Kconfig reference found for $symbol"
-            else
-              echo "WARNING: no Kconfig reference found for $symbol"
+            if ! grep -qx "${symbol}=m" "$CONFIG_FILE"; then
+              echo "ERROR: $symbol is not enabled as a module."
+              grep -E "^(${symbol}=|# ${symbol} is not set)" \
+                "$CONFIG_FILE" || true
+              exit 1
             fi
           done
 
-      - name: Generate Debian source rules
-        working-directory: linux-6.12.113
-        shell: bash
-        run: |
-          set -eux
-          debian/rules source
+          echo "All requested modules are enabled."
 
-      - name: Build amd64 kernel packages
+      - name: Build only amd64 kernel flavour packages
         working-directory: linux-6.12.113
         shell: bash
+        env:
+          DEB_RULES_REQUIRES_ROOT: "no"
+          DEB_BUILD_PROFILES: "pkg.linux.nokerneldbg pkg.linux.nokerneldbginfo"
         run: |
           set -eux
+          export MAKEFLAGS="-j$(nproc)"
+
           make -f debian/rules.gen binary-arch_amd64_none_amd64
 
-      - name: Build architecture-independent packages
-        working-directory: linux-6.12.113
-        shell: bash
-        run: |
-          set -eux
-          make -f debian/rules.gen binary-indep_none
-
-      - name: Verify requested modules in Debian packages
+      - name: Verify modules in generated packages
         if: always()
         continue-on-error: true
-        working-directory: linux-6.12.113
         shell: bash
         run: |
           set -u
           shopt -s nullglob
 
-          packages=(../*.deb)
+          packages=(linux-6.12.113/../*.deb)
 
           if ((${#packages[@]} == 0)); then
-            echo "WARNING: no Debian packages found; skipping module verification"
+            echo "WARNING: no Debian packages found."
             exit 0
           fi
 
@@ -190,14 +140,11 @@ jobs:
           trap 'rm -f "$listing"' EXIT
 
           for deb in "${packages[@]}"; do
-            echo "Inspecting package: $deb"
+            echo "Inspecting $deb"
             if ! dpkg-deb --contents "$deb" >> "$listing"; then
-              echo "WARNING: could not inspect $deb"
+              echo "WARNING: failed to inspect $deb"
             fi
           done
-
-          echo "Matching module paths:"
-          grep -Ei 'bytcrc|punit|atomisp|gc2235' "$listing" || true
 
           for module in \
             intel_bytcrc_pwrsrc \
@@ -205,16 +152,15 @@ jobs:
             atomisp \
             atomisp-gc2235
           do
-            if grep -Eq "/${module}\.ko(\.(xz|zst|gz))?([[:space:]]|$)" "$listing"; then
+            if grep -Eq "/${module}\.ko(\.(xz|zst|gz))?([[:space:]]|$)" \
+              "$listing"; then
               echo "FOUND: $module"
             else
-              echo "WARNING: $module not found in Debian packages"
+              echo "WARNING: $module not found in packages"
             fi
           done
 
-          echo "Module verification finished without failing the job."
-
-      - name: Upload Debian packages
+      - name: Upload kernel packages
         if: always()
         uses: actions/upload-artifact@v4
         with:
