@@ -89,36 +89,10 @@ jobs:
         run: |
           set -eux
 
-          # Debian reads debian/config.local when generating the flavour config.
-          cat > debian/config.local <<'EOF'
-          # AtomISP parent option is boolean, not a module.
-          CONFIG_INTEL_ATOMISP=y
-
-          # AtomISP dependencies.
-          CONFIG_X86=y
-          CONFIG_EFI=y
-          CONFIG_PCI=y
-          CONFIG_ACPI=y
-          CONFIG_COMMON_CLK=y
-          CONFIG_IOSF_MBI=y
-          CONFIG_MEDIA_SUPPORT=y
-          CONFIG_MEDIA_CONTROLLER=y
-          CONFIG_MEDIA_PCI_SUPPORT=y
-          CONFIG_PMIC_OPREGION=y
-          CONFIG_VIDEO_DEV=m
-          CONFIG_I2C=m
-          CONFIG_IPU_BRIDGE=m
-
-          # Requested modules.
-          CONFIG_INTEL_BYTCRC_PWRSRC=m
-          CONFIG_INTEL_PUNIT_IPC=m
-          CONFIG_VIDEO_ATOMISP=m
-          CONFIG_VIDEO_ATOMISP_GC2235=m
-          EOF
-
-          # Generate Debian kernel build rules/configuration.
+          # 1. Генерируем базовые правила сборки Debian
           debian/rules source
 
+          # 2. Создаем базовый конфиг для нужного флейвора (amd64)
           DEB_RULES_REQUIRES_ROOT=no \
             make -f debian/rules.gen setup_amd64_none_amd64
 
@@ -126,6 +100,32 @@ jobs:
           CONFIG="$BUILD_DIR/.config"
 
           test -f "$CONFIG"
+
+          # 3. Переходим в директорию билда, где лежит .config
+          cd "$BUILD_DIR"
+
+          # 4. Включаем модули и их базовые подсистемы через штатный скрипт ядра.
+          # Именно так предписывает делать Debian Kernel Handbook (раздел 4.5.3).
+          ../../../../scripts/config \
+            --enable CONFIG_INTEL_ATOMISP \
+            --module CONFIG_INTEL_BYTCRC_PWRSRC \
+            --module CONFIG_INTEL_PUNIT_IPC \
+            --module CONFIG_VIDEO_ATOMISP \
+            --module CONFIG_VIDEO_ATOMISP_GC2235 \
+            --enable CONFIG_MEDIA_SUPPORT \
+            --enable CONFIG_MEDIA_CONTROLLER \
+            --enable CONFIG_MEDIA_PCI_SUPPORT \
+            --enable CONFIG_VIDEO_DEV \
+            --enable CONFIG_I2C \
+            --enable CONFIG_PMIC_OPREGION \
+            --enable CONFIG_IOSF_MBI \
+            --enable CONFIG_COMMON_CLK
+
+          # 5. olddefconfig автоматически подтянет все скрытые зависимости (select/depends on)
+          make olddefconfig
+
+          # Возвращаемся в корень дерева исходников
+          cd ../../../../
 
           echo "Checking final generated configuration:"
           for symbol in \
