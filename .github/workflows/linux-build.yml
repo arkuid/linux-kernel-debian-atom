@@ -89,6 +89,9 @@ jobs:
         run: |
           set -eux
 
+          # Сохраняем абсолютный путь к корню исходников, чтобы не путаться в ../
+          SOURCE_ROOT="$(pwd)"
+
           # 1. Генерируем базовые правила сборки Debian
           debian/rules source
 
@@ -105,8 +108,7 @@ jobs:
           cd "$BUILD_DIR"
 
           # 4. Включаем модули и их базовые подсистемы через штатный скрипт ядра.
-          # Именно так предписывает делать Debian Kernel Handbook (раздел 4.5.3).
-          ../../../../scripts/config \
+          "$SOURCE_ROOT/scripts/config" \
             --enable CONFIG_INTEL_ATOMISP \
             --module CONFIG_INTEL_BYTCRC_PWRSRC \
             --module CONFIG_INTEL_PUNIT_IPC \
@@ -125,7 +127,7 @@ jobs:
           make olddefconfig
 
           # Возвращаемся в корень дерева исходников
-          cd ../../../../
+          cd "$SOURCE_ROOT"
 
           echo "Checking final generated configuration:"
           for symbol in \
